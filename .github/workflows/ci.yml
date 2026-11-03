@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: saas
+          POSTGRES_USER: saas_owner
+          POSTGRES_PASSWORD: owner_password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U saas_owner -d saas"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://app_user:app_password@localhost:5432/saas
+      MIGRATION_DATABASE_URL: postgresql://saas_owner:owner_password@localhost:5432/saas
+      JWT_ACCESS_SECRET: ci-only-secret-that-is-long-enough-0123456789
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - name: Create restricted app role
+        run: psql "$MIGRATION_DATABASE_URL" -c "CREATE ROLE app_user LOGIN NOSUPERUSER NOBYPASSRLS PASSWORD 'app_password';"
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npx prisma migrate deploy
+      - run: SEED_DEMO=false npx tsx prisma/seed.ts
+      - run: npm run typecheck
+      - run: npm test
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
