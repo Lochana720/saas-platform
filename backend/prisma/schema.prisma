@@ -1,0 +1,258 @@
+// =============================================================================
+// Multi-tenant SaaS platform — data model
+//
+// Tenant isolation strategy: shared database, shared schema, `tenantId` column
+// on every tenant-owned table, enforced by PostgreSQL Row-Level Security (see
+// prisma/migrations/*_rls). Amounts are stored as integers in cents.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  ADMIN
+  MANAGER
+  EMPLOYEE
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  CARD
+  CHEQUE
+  ONLINE
+}
+
+// ---------- Global (not tenant-scoped) ---------------------------------------
+
+model Plan {
+  id                  String         @id // "free" | "pro" | "enterprise"
+  name                String
+  priceMonthly        Int // cents (LKR)
+  maxUsers            Int
+  maxInvoicesPerMonth Int? // null = unlimited
+  features            String[]
+  sortOrder           Int            @default(0)
+  subscriptions       Subscription[]
+}
+
+model Tenant {
+  id        String       @id @default(uuid())
+  name      String
+  slug      String       @unique
+  status    TenantStatus @default(ACTIVE)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  memberships   Membership[]
+  invitations   Invitation[]
+  subscription  Subscription?
+  customers     Customer[]
+  invoices      Invoice[]
+  invoiceItems  InvoiceItem[]
+  payments      Payment[]
+  auditLogs     AuditLog[]
+  refreshTokens RefreshToken[]
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  memberships      Membership[]
+  refreshTokens    RefreshToken[]
+  invoicesCreated  Invoice[]      @relation("InvoiceCreatedBy")
+  paymentsRecorded Payment[]      @relation("PaymentRecordedBy")
+  invitationsSent  Invitation[]   @relation("InvitedBy")
+  auditLogs        AuditLog[]
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tenantId  String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ---------- Tenant-scoped (Row-Level Security enabled) ------------------------
+
+model Membership {
+  id        String   @id @default(uuid())
+  tenantId  String
+  userId    String
+  role      Role     @default(EMPLOYEE)
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, userId])
+  @@index([userId])
+}
+
+model Invitation {
+  id          String    @id @default(uuid())
+  tenantId    String
+  email       String
+  role        Role      @default(EMPLOYEE)
+  token       String    @unique
+  invitedById String
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invitedBy User   @relation("InvitedBy", fields: [invitedById], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+model Subscription {
+  id                 String             @id @default(uuid())
+  tenantId           String             @unique
+  planId             String
+  status             SubscriptionStatus @default(ACTIVE)
+  currentPeriodStart DateTime           @default(now())
+  currentPeriodEnd   DateTime
+  cancelAtPeriodEnd  Boolean            @default(false)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  plan   Plan   @relation(fields: [planId], references: [id])
+}
+
+model Customer {
+  id        String   @id @default(uuid())
+  tenantId  String
+  name      String
+  email     String?
+  phone     String?
+  address   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoices Invoice[]
+
+  @@index([tenantId])
+}
+
+model Invoice {
+  id          String        @id @default(uuid())
+  tenantId    String
+  number      Int
+  customerId  String
+  status      InvoiceStatus @default(DRAFT)
+  issueDate   DateTime
+  dueDate     DateTime
+  currency    String        @default("LKR")
+  taxRate     Int           @default(0) // percent, e.g. 18
+  subtotal    Int           @default(0)
+  tax         Int           @default(0)
+  total       Int           @default(0)
+  amountPaid  Int           @default(0)
+  notes       String?
+  createdById String
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  tenant    Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer  Customer      @relation(fields: [customerId], references: [id])
+  createdBy User          @relation("InvoiceCreatedBy", fields: [createdById], references: [id])
+  items     InvoiceItem[]
+  payments  Payment[]
+
+  @@unique([tenantId, number])
+  @@index([tenantId, status])
+}
+
+model InvoiceItem {
+  id          String @id @default(uuid())
+  tenantId    String
+  invoiceId   String
+  description String
+  quantity    Int
+  unitPrice   Int
+  amount      Int
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+model Payment {
+  id           String        @id @default(uuid())
+  tenantId     String
+  invoiceId    String
+  amount       Int
+  method       PaymentMethod
+  reference    String?
+  paidAt       DateTime
+  recordedById String
+  createdAt    DateTime      @default(now())
+
+  tenant     Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  invoice    Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  recordedBy User    @relation("PaymentRecordedBy", fields: [recordedById], references: [id])
+
+  @@index([tenantId, paidAt])
+  @@index([invoiceId])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  tenantId   String
+  actorId    String?
+  action     String // e.g. "invoice.created"
+  entityType String
+  entityId   String?
+  metadata   Json?
+  ip         String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  actor  User?  @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, createdAt])
+}
